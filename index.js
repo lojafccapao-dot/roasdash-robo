@@ -1,93 +1,91 @@
 // ============================================================
-//  ROASDASH — Robô Macle -> Meta (conversões offline)
-//  Roda 1 vez por execução. No Render (Cron Job) rode: node index.js
-//  Todas as configs vêm das VARIÁVEIS DE AMBIENTE (aba Environment do Render).
-//  Nenhuma chave fica no código.
+//  ROASDASH — Robô Macle (ApiCRM) -> Meta (conversões offline)
+//  Roda 1x por execução (Render Cron Job): node index.js
+//  Configs vêm das VARIÁVEIS DE AMBIENTE (aba Environment).
 // ============================================================
 import crypto from "node:crypto";
-
 const g = (k, d = "") => process.env[k] ?? d;
 
-const CFG = {
-  mode: g("MODE", "dry-run").toLowerCase(),              // dry-run (testa) | live (envia)
-  lookbackHours: parseFloat(g("LOOKBACK_HOURS", "48")),  // 48 = ontem + hoje
-  macle: {
-    url: g("MACLE_SALES_URL"),
-    authName: g("MACLE_AUTH_HEADER_NAME", "Authorization"),
-    authValue: g("MACLE_AUTH_HEADER_VALUE"),
-    f: {
-      id: g("F_ORDER_ID", "id"), datetime: g("F_DATETIME", "data"),
-      value: g("F_VALUE", "valor"), phone: g("F_PHONE", "telefone"), email: g("F_EMAIL", "email"),
-    },
-  },
-  meta: {
-    datasetId: g("META_DATASET_ID"), token: g("META_ACCESS_TOKEN"),
-    version: g("META_API_VERSION", "v21.0"),
-    currency: g("CURRENCY", "BRL"), actionSource: g("ACTION_SOURCE", "physical_store"),
-  },
-};
+const MODE = g("MODE", "dry-run").toLowerCase();       // dry-run (testa) | live (envia)
+const LOOKBACK = parseFloat(g("LOOKBACK_HOURS", "48")); // 48 = ontem + hoje
+const BASE = (g("MACLE_SALES_URL") || "").split("?")[0]; // usa só a base da ApiCRM
+const AUTH_NAME = g("MACLE_AUTH_HEADER_NAME", "x-api-key");
+const AUTH_VALUE = g("MACLE_AUTH_HEADER_VALUE");
+const DATASET = g("META_DATASET_ID");
+const TOKEN = g("META_ACCESS_TOKEN");
+const VER = g("META_API_VERSION", "v21.0");
+const CURRENCY = g("CURRENCY", "BRL");
+const ACTION_SOURCE = g("ACTION_SOURCE", "physical_store");
 
-const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
-const fmtDate = (d) => d.toISOString().slice(0, 10);
+const sha = (v) => crypto.createHash("sha256").update(v).digest("hex");
 function normPhone(p) { let d = String(p).replace(/\D/g, ""); if (d.length >= 10 && d.length <= 11) d = "55" + d; return d; }
+function ddmmyyyy(dt) { const d = String(dt.getDate()).padStart(2, "0"); const m = String(dt.getMonth() + 1).padStart(2, "0"); return `${d}/${m}/${dt.getFullYear()}`; }
+function parseBR(s) { const p = String(s).split("/"); if (p.length !== 3) return 0; const dt = new Date(Number(p[2]), Number(p[1]) - 1, Number(p[0]), 12, 0, 0); return Math.floor(dt.getTime() / 1000); }
 
-async function fetchSales() {
-  const now = new Date();
-  const from = new Date(now.getTime() - CFG.lookbackHours * 3600 * 1000);
-  const url = (CFG.macle.url || "").replace("{from}", fmtDate(from)).replace("{to}", fmtDate(now));
-  if (!url) throw new Error("MACLE_SALES_URL não configurado (aba Environment).");
+async function apiGet(action, from, to) {
+  const url = `${BASE}?action=${action}&dataINI=${from}&dataFIM=${to}`;
   const headers = {};
-  if (CFG.macle.authValue) headers[CFG.macle.authName] = CFG.macle.authValue;
+  if (AUTH_VALUE) headers[AUTH_NAME] = AUTH_VALUE;
   const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`Macle respondeu HTTP ${res.status}`);
-  const json = await res.json();
-  const rows = Array.isArray(json) ? json : (json.data || json.vendas || json.sales || []);
-  const f = CFG.macle.f;
-  return rows.map((r) => ({
-    orderId: String(r[f.id] ?? ""),
-    datetime: r[f.datetime],
-    value: parseFloat(String(r[f.value] ?? "0").replace(",", ".")) || 0,
-    phone: r[f.phone] || "", email: r[f.email] || "",
-  })).filter((s) => s.orderId && s.value > 0);
+  if (!res.ok) throw new Error(`Macle (${action}) HTTP ${res.status}`);
+  return res.json();
 }
-
-function toEvent(s) {
-  const user = {};
-  if (s.email) user.em = [sha256(String(s.email).trim().toLowerCase())];
-  if (s.phone) user.ph = [sha256(normPhone(s.phone))];
-  return {
-    event_name: "Purchase",
-    event_time: Math.floor(new Date(s.datetime).getTime() / 1000) || Math.floor(Date.now() / 1000),
-    event_id: `macle-${s.orderId}`,           // Meta deduplica por aqui — nunca conta 2x
-    action_source: CFG.meta.actionSource,
-    user_data: user,
-    custom_data: { value: s.value, currency: CFG.meta.currency },
-  };
-}
-const chunk = (a, n) => { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; };
 
 async function main() {
-  const stamp = new Date().toISOString();
-  const sales = await fetchSales();
-  console.log(`[${stamp}] ${sales.length} venda(s) na janela · modo ${CFG.mode}`);
-  if (!sales.length) return;
+  const now = new Date();
+  const from = new Date(now.getTime() - LOOKBACK * 3600 * 1000);
+  const f = ddmmyyyy(from), t = ddmmyyyy(now);
+  console.log(`Janela ${f} a ${t} · modo ${MODE}`);
+  if (!BASE) throw new Error("MACLE_SALES_URL não configurado.");
 
-  const events = sales.map(toEvent);
-  if (CFG.mode !== "live") {
+  const vendas = await apiGet("vendas", f, t);
+  const clientes = await apiGet("clientes", f, t);
+
+  const mapa = new Map();
+  for (const c of (Array.isArray(clientes) ? clientes : [])) {
+    if (c && c.codCliente) mapa.set(String(c.codCliente), { phone: c.celular || "", email: c.email || "" });
+  }
+
+  const events = [];
+  let semCliente = 0;
+  for (const v of (Array.isArray(vendas) ? vendas : [])) {
+    const cod = String(v.codCliente || "0.0");
+    const cli = mapa.get(cod);
+    const phone = cli ? cli.phone : "";
+    const email = cli ? cli.email : "";
+    if (cod === "0.0" || (!phone && !email)) { semCliente++; continue; }
+    const user = {};
+    if (email) user.em = [sha(String(email).trim().toLowerCase())];
+    if (phone) user.ph = [sha(normPhone(phone))];
+    events.push({
+      event_name: "Purchase",
+      event_time: parseBR(v.dataEmissao) || Math.floor(Date.now() / 1000),
+      event_id: `macle-${v.codVenda}`,
+      action_source: ACTION_SOURCE,
+      user_data: user,
+      custom_data: { value: Number(v.valor) || 0, currency: CURRENCY },
+    });
+  }
+
+  const totalVendas = Array.isArray(vendas) ? vendas.length : 0;
+  console.log(`${totalVendas} venda(s) · ${events.length} com cliente identificado · ${semCliente} consumidor (sem cadastro)`);
+  if (!events.length) { console.log("Nada para enviar (nenhuma venda com cliente identificado na janela)."); return; }
+
+  if (MODE !== "live") {
     console.log("DRY-RUN — enviaria", events.length, "evento(s). Exemplo:", JSON.stringify(events[0]));
     return;
   }
-  if (!CFG.meta.datasetId || !CFG.meta.token) throw new Error("META_DATASET_ID / META_ACCESS_TOKEN ausentes.");
-  const url = `https://graph.facebook.com/${CFG.meta.version}/${CFG.meta.datasetId}/events`;
+  if (!DATASET || !TOKEN) throw new Error("META_DATASET_ID / META_ACCESS_TOKEN ausentes.");
+  const url = `https://graph.facebook.com/${VER}/${DATASET}/events`;
+  const chunk = (a, n) => { const o = []; for (let i = 0; i < a.length; i += n) o.push(a.slice(i, i + n)); return o; };
   let sent = 0;
   for (const part of chunk(events, 1000)) {
-    const body = new URLSearchParams({ data: JSON.stringify(part), access_token: CFG.meta.token });
+    const body = new URLSearchParams({ data: JSON.stringify(part), access_token: TOKEN });
     const res = await fetch(url, { method: "POST", body });
     const j = await res.json();
     if (!res.ok) throw new Error(`Meta HTTP ${res.status}: ${JSON.stringify(j)}`);
     sent += part.length;
   }
-  console.log(`[${stamp}] ✓ ${sent} venda(s) enviada(s) ao Meta.`);
+  console.log(`✓ ${sent} venda(s) enviada(s) ao Meta.`);
 }
-
 main().catch((e) => { console.error("ERRO:", e.message); process.exit(1); });
